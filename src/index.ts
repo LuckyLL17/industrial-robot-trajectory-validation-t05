@@ -7,8 +7,32 @@ const robots:Robot[]=[{id:'robot-01',name:'六轴焊接机器人 A',dof:6,reach:
 const cells:any[]=[{id:'cell-01',name:'车身侧围焊装单元',robotId:'robot-01',tools:[{id:'gun-01',mass:12,tcp:{x:0,y:0,z:220}}],obstacles:[{id:'fence',type:'box',center:{x:0,y:0,z:700},size:{x:1800,y:1800,z:1600}},{id:'fixture',type:'box',center:{x:500,y:0,z:300},size:{x:420,y:360,z:300}}]}];
 const paths:any[]=[];const validations:any[]=[];const plans:any[]=[];const executions:any[]=[];const audit:any[]=[];const log=(action:string,payload:any)=>audit.push({id:randomUUID(),time:now(),action,payload});
 function distance(a:Pose,b:Pose){return Math.hypot(a.x-b.x,a.y-b.y,a.z-b.z)}
-function insideBox(p:Pose,b:any){return Math.abs(p.x-b.center.x)<=b.size.x/2&&Math.abs(p.y-b.center.y)<=b.size.y/2&&Math.abs(p.z-b.center.z)<=b.size.z/2}
-function validatePath(path:any){const robot=robots.find(x=>x.id===path.robotId);const cell=cells.find(x=>x.id===path.cellId);const errors:any[]=[];let length=0,maxSpeed=0;for(let i=1;i<path.waypoints.length;i++){const prev=path.waypoints[i-1],cur=path.waypoints[i];length+=distance(prev,cur);maxSpeed=Math.max(maxSpeed,Number(cur.speed||0));for(const ob of cell?.obstacles||[]){if(insideBox(cur,ob)||insideBox({x:(prev.x+cur.x)/2,y:(prev.y+cur.y)/2,z:(prev.z+cur.z)/2,rx:0,ry:0,rz:0},ob))errors.push({type:'collision',obstacleId:ob.id,segment:i-1,clearance:0});}}
+// Exact segment/AABB overlap test (slab clipping, Liang–Barsky). Returns true iff
+// the straight segment prev->cur has any point inside or on the box boundary.
+// This is a closed-form test — no sampling — so tunneling through an obstacle
+// between sampled points is impossible. Boundary contact counts as a collision
+// (inclusive, closed-box semantics for tangent contact).
+function segmentHitsBox(prev:Pose,cur:any,b:any){
+	const hx=b.size.x/2,hy=b.size.y/2,hz=b.size.z/2;
+	let tEnter=0,tExit=1;
+	const axes:['x','y','z']=['x','y','z'];const half=[hx,hy,hz];
+	for(let k=0;k<3;k++){
+		const axis=axes[k],lo=b.center[axis]-half[k],hi=b.center[axis]+half[k];
+		const a=prev[axis],d=cur[axis]-a;
+		if(Math.abs(d)<1e-12){
+			// Degenerate (parallel) axis: the whole segment shares this coordinate.
+			if(a<lo||a>hi)return false;
+			continue;
+		}
+		let t1=(lo-a)/d,t2=(hi-a)/d;
+		if(t1>t2){const tmp=t1;t1=t2;t2=tmp;}
+		tEnter=Math.max(tEnter,t1);
+		tExit=Math.min(tExit,t2);
+		if(tEnter>tExit)return false;
+	}
+	return true;
+}
+function validatePath(path:any){const robot=robots.find(x=>x.id===path.robotId);const cell=cells.find(x=>x.id===path.cellId);const errors:any[]=[];let length=0,maxSpeed=0;for(let i=1;i<path.waypoints.length;i++){const prev=path.waypoints[i-1],cur=path.waypoints[i];length+=distance(prev,cur);maxSpeed=Math.max(maxSpeed,Number(cur.speed||0));for(const ob of cell?.obstacles||[]){if(ob.type==='box'&&segmentHitsBox(prev,cur,ob))errors.push({type:'collision',obstacleId:ob.id,segment:i-1,clearance:0});}}
 for(const p of path.waypoints){const reach=Math.hypot(p.x,p.y,p.z);if(reach>Number(robot?.reach||0))errors.push({type:'unreachable',waypoint:p});if(Math.abs(p.rx)>180||Math.abs(p.ry)>180||Math.abs(p.rz)>360)errors.push({type:'orientation-limit',waypoint:p});}
 if(maxSpeed>220)errors.push({type:'speed-limit',maxSpeed});return{valid:errors.length===0,errors,length:Number(length.toFixed(2)),maxSpeed,estimatedSeconds:Number((length/Math.max(1,maxSpeed||100)).toFixed(2)),singularityRisk:path.waypoints.filter((p:any)=>Math.abs(p.z)<80).length};}
 app.get('/health',async()=>({ok:true,service:'industrial-robot-trajectory-validation',time:now()}));
@@ -17,7 +41,7 @@ app.post('/api/paths',async(req:any,res)=>{const b=req.body as any;if(!b.cellId|
 app.post('/api/paths/:id/validate',async(req:any,res)=>{const p=paths.find(x=>x.id===(req.params as any).id);if(!p)return res.code(404).send({error:'path not found'});const result=validatePath(p);const v={id:randomUUID(),pathId:p.id,createdAt:now(),...result};validations.push(v);p.lastValidationId=v.id;p.status=result.valid?'validated':'blocked';log('path.validate',v);return v;});
 app.post('/api/paths/:id/plan',async(req:any,res)=>{const p=paths.find(x=>x.id===(req.params as any).id);if(!p)return res.code(404).send({error:'path not found'});const v=validations.filter(x=>x.pathId===p.id).at(-1);if(!v?.valid)return res.code(409).send({error:'path must pass collision validation'});const b=req.body as any;const plan={id:randomUUID(),pathId:p.id,controller:b.controller||'RAPID',posture:b.posture||'elbow-up',blendPolicy:b.blendPolicy||'smooth',samplingMs:Number(b.samplingMs||20),segments:p.waypoints.slice(1).map((w:any,i:number)=>({index:i+1,from:p.waypoints[i],to:w,acceleration:Number((Math.min(2.5,(w.speed||100)/80)).toFixed(2))})),status:'planned',createdAt:now()};plans.push(plan);log('trajectory.plan',plan);return plan;});
 app.post('/api/paths/:id/optimize',async(req:any,res)=>{const p=paths.find(x=>x.id===(req.params as any).id);if(!p)return res.code(404).send({error:'path not found'});const candidates=[.75,1,1.2].map(scale=>{const copy={...p,waypoints:p.waypoints.map((w:any)=>({...w,speed:Math.min(220,(w.speed||100)*scale),blend:Math.min(100,(w.blend||10)+scale*5)}))};return{scale,validation:validatePath(copy),waypoints:copy.waypoints}}).filter(x=>x.validation.valid).sort((a,b)=>a.validation.estimatedSeconds-b.validation.estimatedSeconds);return{pathId:p.id,candidates,best:candidates[0]||null};});
-app.post('/api/executions',async(req:any,res)=>{const b=req.body as any;const p=paths.find(x=>x.id===b.pathId);if(!p)return res.code(404).send({error:'path not found'});const v=validations.filter(x=>x.pathId===p.id).at(-1);if(!v?.valid)return res.code(409).send({error:'execution blocked by validation'});const e={id:randomUUID(),pathId:p.id,mode:b.mode||'dry-run',startedAt:now(),status:'running',progress:0,telemetry:[],safety:{eStop:false,protectiveStop:false}};executions.push(e);for(let i=0;i<p.waypoints.length;i++){e.progress=Math.round((i+1)/p.waypoints.length*100);e.telemetry.push({time:now(),waypoint:i,joints:p.waypoints[i],tcpSpeed:p.waypoints[i].speed});}e.status='completed';e.finishedAt=now();log('execution.complete',e);return e;});
+app.post('/api/executions',async(req:any,res)=>{const b=req.body as any;const p=paths.find(x=>x.id===b.pathId);if(!p)return res.code(404).send({error:'path not found'});const v=validations.filter(x=>x.pathId===p.id).at(-1);if(!v?.valid)return res.code(409).send({error:'execution blocked by validation'});const e:any={id:randomUUID(),pathId:p.id,mode:b.mode||'dry-run',startedAt:now(),status:'running',progress:0,telemetry:[],safety:{eStop:false,protectiveStop:false}};executions.push(e);for(let i=0;i<p.waypoints.length;i++){e.progress=Math.round((i+1)/p.waypoints.length*100);e.telemetry.push({time:now(),waypoint:i,joints:p.waypoints[i],tcpSpeed:p.waypoints[i].speed});}e.status='completed';e.finishedAt=now();log('execution.complete',e);return e;});
 app.post('/api/executions/:id/stop',async(req:any,res)=>{const e=executions.find(x=>x.id===(req.params as any).id);if(!e)return res.code(404).send({error:'execution not found'});e.status='protective-stopped';e.safety.protectiveStop=true;e.stoppedAt=now();return e;});
 app.get('/api/paths/:id/compare',async(req:any,res)=>{const p=paths.find(x=>x.id===(req.params as any).id);if(!p)return res.code(404).send({error:'path not found'});const versions=paths.filter(x=>x.name===p.name).map(x=>({id:x.id,version:x.version,validation:validations.filter(v=>v.pathId===x.id).at(-1)}));return{pathId:p.id,versions};});
 app.get('/api/audit',async()=>audit.slice(-100));
